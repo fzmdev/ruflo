@@ -356,7 +356,7 @@ export class DeltaCompression implements CompressionStrategy {
     };
   }
 
-  estimateRatio(content: string): number {
+  estimateRatio(_content: string): number {
     // Delta can achieve 10-40% if good base exists
     return 0.3;
   }
