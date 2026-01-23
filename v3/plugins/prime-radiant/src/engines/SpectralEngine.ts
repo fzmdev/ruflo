@@ -268,7 +268,7 @@ export class SpectralEngine implements ISpectralEngine {
     for (let i = 0; i < n; i++) {
       let sum = 0;
       for (let j = 0; j < n; j++) {
-        sum += matrix[i * n + j] * vector[j];
+        sum += (matrix[i * n + j] ?? 0) * (vector[j] ?? 0);
       }
       result[i] = sum;
     }
