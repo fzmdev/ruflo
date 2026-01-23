@@ -16,8 +16,19 @@ Think of it as having a team of QA engineers who never sleep, never miss edge ca
 
 ## Installation
 
+**Via Claude Flow CLI (recommended):**
+```bash
+npx claude-flow plugins install --name @claude-flow/plugin-agentic-qe
+```
+
+**Via npm:**
 ```bash
 npm install @claude-flow/plugin-agentic-qe
+```
+
+**Verify installation:**
+```bash
+npx claude-flow plugins list
 ```
 
 ---
