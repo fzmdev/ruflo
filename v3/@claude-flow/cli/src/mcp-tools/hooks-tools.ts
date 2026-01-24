@@ -698,7 +698,7 @@ export const hooksPostCommand: MCPTool = {
 
 export const hooksRoute: MCPTool = {
   name: 'hooks_route',
-  description: 'Route task to optimal agent using semantic similarity (47k routes/s)',
+  description: 'Route task to optimal agent using semantic similarity (native HNSW or pure JS)',
   inputSchema: {
     type: 'object',
     properties: {
@@ -713,19 +713,51 @@ export const hooksRoute: MCPTool = {
     const context = params.context as string | undefined;
     const useSemanticRouter = params.useSemanticRouter !== false;
 
-    // Try semantic routing first (47k routes/s, 0.021ms latency)
-    const router = useSemanticRouter ? await getSemanticRouter() : null;
+    // Get router (tries native VectorDb first, falls back to pure JS)
+    const { router, backend, native } = useSemanticRouter
+      ? await getSemanticRouter()
+      : { router: null, backend: 'none' as const, native: null };
+
     let semanticResult: { intent: string; score: number; metadata: Record<string, unknown> }[] = [];
     let routingMethod = 'keyword';
     let routingLatencyMs = 0;
+    let backendInfo = '';
 
-    if (router) {
+    const queryText = context ? `${task} ${context}` : task;
+    const queryEmbedding = generateSimpleEmbedding(queryText);
+
+    // Try native VectorDb (HNSW-backed)
+    if (native && backend === 'native') {
       const routeStart = performance.now();
-      const queryText = context ? `${task} ${context}` : task;
-      const queryEmbedding = generateSimpleEmbedding(queryText);
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const results = (native as any).search(queryEmbedding, 5);
+        routingLatencyMs = performance.now() - routeStart;
+        routingMethod = 'semantic-native';
+        backendInfo = 'native VectorDb (HNSW)';
+
+        // Convert results to semantic format
+        semanticResult = results.map((r: { id: string; score: number }) => {
+          const [patternName] = r.id.split(':');
+          const pattern = TASK_PATTERNS[patternName];
+          return {
+            intent: patternName,
+            score: 1 - r.score, // Native uses distance (lower is better), convert to similarity
+            metadata: { agents: pattern?.agents || ['coder'] },
+          };
+        });
+      } catch {
+        // Native failed, try pure JS fallback
+      }
+    }
+
+    // Try pure JS SemanticRouter fallback
+    if (router && backend === 'pure-js' && semanticResult.length === 0) {
+      const routeStart = performance.now();
       semanticResult = router.routeWithEmbedding(queryEmbedding, 3);
       routingLatencyMs = performance.now() - routeStart;
-      routingMethod = 'semantic';
+      routingMethod = 'semantic-pure-js';
+      backendInfo = 'pure JS (cosine similarity)';
     }
 
     // Get agents from semantic routing or fall back to keyword
@@ -733,7 +765,7 @@ export const hooksRoute: MCPTool = {
     let confidence: number;
     let matchedPattern = '';
 
-    if (semanticResult.length > 0 && semanticResult[0].score > 0.5) {
+    if (semanticResult.length > 0 && semanticResult[0].score > 0.4) {
       const topMatch = semanticResult[0];
       agents = (topMatch.metadata.agents as string[]) || ['coder', 'researcher'];
       confidence = topMatch.score;
@@ -745,6 +777,7 @@ export const hooksRoute: MCPTool = {
       confidence = suggestion.confidence;
       matchedPattern = 'keyword-fallback';
       routingMethod = 'keyword';
+      backendInfo = 'keyword matching';
     }
 
     // Determine complexity
