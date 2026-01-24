@@ -715,77 +715,228 @@ export class FormulaExecutor extends EventEmitter {
       this.executions.set(executionId, progress);
       this.emit('execution:start', executionId, cooked);
 
+      // Create debounced progress emitter (100ms debounce)
+      const progressEmitter = new DebouncedEmitter<ExecutionProgress>(
+        (p) => this.emit('execution:progress', p),
+        100
+      );
+      this.progressEmitters.set(executionId, progressEmitter);
+
       // Step 2: Resolve dependencies and get execution order
       const orderedSteps = this.getOrderedExecutionUnits(cooked);
 
-      // Step 3: Execute steps
+      // Step 3: Execute steps with parallel execution where deps allow
       const results: StepResult[] = [];
       const previousResults = new Map<string, StepResult>();
+      const maxParallel = options.maxParallel ?? this.defaultMaxParallel;
 
-      for (let i = 0; i < orderedSteps.length; i++) {
-        // Check for cancellation
-        if (signal.aborted) {
-          progress.status = 'cancelled';
-          this.emit('execution:cancelled', executionId);
-          throw new GasTownError(
-            'Execution cancelled',
-            GasTownErrorCode.UNKNOWN,
-            { executionId }
-          );
+      // Use parallel execution with work stealing if enabled
+      if (maxParallel > 1 && orderedSteps.length > 1) {
+        // Build dependency graph for parallel execution
+        const stepDeps = new Map<string, Set<string>>();
+        const stepById = new Map<string, Step>();
+        const stepIndex = new Map<string, number>();
+
+        for (let i = 0; i < orderedSteps.length; i++) {
+          const step = orderedSteps[i];
+          stepById.set(step.id, step);
+          stepIndex.set(step.id, i);
+          stepDeps.set(step.id, new Set(step.needs ?? []));
         }
 
-        const step = orderedSteps[i];
-        progress.currentStep = step.id;
+        // Track completed steps
+        const completed = new Set<string>();
+        const inProgress = new Set<string>();
 
-        const context: StepContext = {
-          executionId,
-          formula: cooked,
-          stepIndex: i,
-          totalSteps: orderedSteps.length,
-          variables: cooked.cookedVars,
-          previousResults,
-          signal,
-          startTime: progress.startTime,
+        // Work stealing queue
+        const workQueue = new WorkStealingQueue(maxParallel);
+
+        // Find steps that can run (no dependencies)
+        const getReadySteps = (): Step[] => {
+          const ready: Step[] = [];
+          for (const step of orderedSteps) {
+            if (completed.has(step.id) || inProgress.has(step.id)) continue;
+            const deps = stepDeps.get(step.id);
+            if (!deps || [...deps].every(d => completed.has(d))) {
+              ready.push(step);
+            }
+          }
+          return ready;
         };
 
-        this.emit('step:start', executionId, step);
-
-        try {
-          const result = await this.runStep(step, context, options);
-          results.push(result);
-          previousResults.set(step.id, result);
-
-          if (result.success) {
-            progress.completedSteps++;
-          } else {
-            progress.failedSteps++;
+        // Execute in parallel waves
+        while (completed.size < orderedSteps.length) {
+          // Check for cancellation
+          if (signal.aborted) {
+            progress.status = 'cancelled';
+            this.emit('execution:cancelled', executionId);
+            throw new GasTownError(
+              'Execution cancelled',
+              GasTownErrorCode.UNKNOWN,
+              { executionId }
+            );
           }
 
-          progress.stepResults.push(result);
-          progress.percentage = Math.round(((i + 1) / orderedSteps.length) * 100);
+          const readySteps = getReadySteps();
+          if (readySteps.length === 0 && inProgress.size === 0) {
+            // Deadlock - should not happen with valid DAG
+            break;
+          }
 
-          this.emit('step:complete', executionId, result);
-          this.emit('execution:progress', { ...progress });
-        } catch (error) {
-          const failedResult: StepResult = {
-            stepId: step.id,
-            success: false,
-            error: error instanceof Error ? error.message : String(error),
-            durationMs: 0,
+          // Limit parallel execution
+          const batchSize = Math.min(readySteps.length, maxParallel - inProgress.size);
+          const batch = readySteps.slice(0, batchSize);
+
+          if (batch.length === 0) {
+            // Wait for in-progress steps to complete
+            await new Promise(resolve => setTimeout(resolve, 10));
+            continue;
+          }
+
+          // Mark as in progress
+          for (const step of batch) {
+            inProgress.add(step.id);
+          }
+
+          // Execute batch in parallel
+          const batchPromises = batch.map(async (step) => {
+            const idx = stepIndex.get(step.id) ?? 0;
+            progress.currentStep = step.id;
+
+            const context: StepContext = {
+              executionId,
+              formula: cooked,
+              stepIndex: idx,
+              totalSteps: orderedSteps.length,
+              variables: cooked.cookedVars,
+              previousResults,
+              signal,
+              startTime: progress.startTime,
+            };
+
+            this.emit('step:start', executionId, step);
+
+            try {
+              const result = await this.runStep(step, context, options);
+              previousResults.set(step.id, result);
+              completed.add(step.id);
+              inProgress.delete(step.id);
+
+              if (result.success) {
+                progress.completedSteps++;
+              } else {
+                progress.failedSteps++;
+              }
+
+              progress.stepResults.push(result);
+              progress.percentage = Math.round((completed.size / orderedSteps.length) * 100);
+
+              this.emit('step:complete', executionId, result);
+              progressEmitter.update({ ...progress });
+
+              return result;
+            } catch (error) {
+              const failedResult: StepResult = {
+                stepId: step.id,
+                success: false,
+                error: error instanceof Error ? error.message : String(error),
+                durationMs: 0,
+              };
+
+              previousResults.set(step.id, failedResult);
+              completed.add(step.id); // Mark as completed (failed)
+              inProgress.delete(step.id);
+              progress.failedSteps++;
+              progress.stepResults.push(failedResult);
+
+              this.emit('step:error', executionId, step.id, error as Error);
+              progressEmitter.update({ ...progress });
+
+              // Continue or fail based on step configuration
+              if (!step.metadata?.continueOnError) {
+                throw error;
+              }
+
+              return failedResult;
+            }
+          });
+
+          const batchResults = await Promise.all(batchPromises);
+          results.push(...batchResults);
+        }
+
+        // Flush final progress
+        progressEmitter.flush();
+      } else {
+        // Sequential execution (original behavior)
+        for (let i = 0; i < orderedSteps.length; i++) {
+          // Check for cancellation
+          if (signal.aborted) {
+            progress.status = 'cancelled';
+            this.emit('execution:cancelled', executionId);
+            throw new GasTownError(
+              'Execution cancelled',
+              GasTownErrorCode.UNKNOWN,
+              { executionId }
+            );
+          }
+
+          const step = orderedSteps[i];
+          progress.currentStep = step.id;
+
+          const context: StepContext = {
+            executionId,
+            formula: cooked,
+            stepIndex: i,
+            totalSteps: orderedSteps.length,
+            variables: cooked.cookedVars,
+            previousResults,
+            signal,
+            startTime: progress.startTime,
           };
 
-          results.push(failedResult);
-          previousResults.set(step.id, failedResult);
-          progress.failedSteps++;
-          progress.stepResults.push(failedResult);
+          this.emit('step:start', executionId, step);
 
-          this.emit('step:error', executionId, step.id, error as Error);
+          try {
+            const result = await this.runStep(step, context, options);
+            results.push(result);
+            previousResults.set(step.id, result);
 
-          // Continue or fail based on step configuration
-          if (!step.metadata?.continueOnError) {
-            throw error;
+            if (result.success) {
+              progress.completedSteps++;
+            } else {
+              progress.failedSteps++;
+            }
+
+            progress.stepResults.push(result);
+            progress.percentage = Math.round(((i + 1) / orderedSteps.length) * 100);
+
+            this.emit('step:complete', executionId, result);
+            progressEmitter.update({ ...progress });
+          } catch (error) {
+            const failedResult: StepResult = {
+              stepId: step.id,
+              success: false,
+              error: error instanceof Error ? error.message : String(error),
+              durationMs: 0,
+            };
+
+            results.push(failedResult);
+            previousResults.set(step.id, failedResult);
+            progress.failedSteps++;
+            progress.stepResults.push(failedResult);
+
+            this.emit('step:error', executionId, step.id, error as Error);
+
+            // Continue or fail based on step configuration
+            if (!step.metadata?.continueOnError) {
+              throw error;
+            }
           }
         }
+
+        // Flush final progress
+        progressEmitter.flush();
       }
 
       // Step 4: Complete execution
