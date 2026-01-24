@@ -646,15 +646,14 @@ const exportCommand: Command = {
           { name: 'Ed25519' },
           true,
           ['sign', 'verify']
-        );
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        ) as any;
 
         const exportBytes = new TextEncoder().encode(JSON.stringify(exportData));
-        // Type assertion needed for webcrypto key pair
-        const kp = keyPair as { privateKey: globalThis.CryptoKey; publicKey: globalThis.CryptoKey };
-        const signatureBytes = await webcrypto.subtle.sign('Ed25519', kp.privateKey, exportBytes);
+        const signatureBytes = await webcrypto.subtle.sign('Ed25519', keyPair.privateKey, exportBytes);
         signature = Buffer.from(signatureBytes).toString('hex');
 
-        const publicKeyBytes = await webcrypto.subtle.exportKey('raw', kp.publicKey);
+        const publicKeyBytes = await webcrypto.subtle.exportKey('raw', keyPair.publicKey);
         publicKey = Buffer.from(publicKeyBytes).toString('hex');
       }
 
