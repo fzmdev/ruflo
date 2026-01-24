@@ -573,7 +573,7 @@ class WasmLoaderAdapter implements IWasmLoader {
   /**
    * Synchronous topological sort using Kahn's algorithm
    */
-  resolveStepDependencies(steps: Array<{ id: string; needs?: string[] }>): typeof steps {
+  resolveStepDependencies(steps: Step[]): Step[] {
     const inDegree = new Map<string, number>();
     const graph = new Map<string, string[]>();
 
@@ -615,7 +615,7 @@ class WasmLoaderAdapter implements IWasmLoader {
     }
 
     const stepMap = new Map(steps.map(s => [s.id, s]));
-    return sorted.map(id => stepMap.get(id)).filter(Boolean) as typeof steps;
+    return sorted.map(id => stepMap.get(id)).filter((s): s is Step => s !== undefined);
   }
 
   /**
