@@ -54,6 +54,32 @@ import {
   MINIMUM_CLAUDE_CODE_VERSION,
   DEFAULT_PLUGIN_CONFIG,
   TeammateErrorCode,
+  RATE_LIMIT_DEFAULTS,
+  RETRY_DEFAULTS,
+  HEALTH_CHECK_DEFAULTS,
+} from './types.js';
+
+import type {
+  RateLimitConfig,
+  RateLimitState,
+  BridgeMetrics,
+  MetricSnapshot,
+  TeammateHealthCheck,
+  TeamHealthReport,
+  HealthCheckConfig,
+  HealthStatus,
+  RetryConfig,
+  RetryState,
+  CircuitBreakerConfig,
+  CircuitBreakerState,
+  CircuitState,
+} from './types.js';
+
+import {
+  DEFAULT_RATE_LIMIT_CONFIG,
+  DEFAULT_HEALTH_CHECK_CONFIG,
+  DEFAULT_RETRY_CONFIG,
+  DEFAULT_CIRCUIT_BREAKER_CONFIG,
 } from './types.js';
 
 // ============================================================================
@@ -115,6 +141,455 @@ function compareVersions(a: string, b: string): number {
 function ensureDirectory(dirPath: string): void {
   if (!fs.existsSync(dirPath)) {
     fs.mkdirSync(dirPath, { recursive: true, mode: 0o700 }); // Secure permissions
+  }
+}
+
+// ============================================================================
+// Rate Limiter Class
+// ============================================================================
+
+class RateLimiter {
+  private windows: Map<string, RateLimitState> = new Map();
+  private readonly windowMs = 60000; // 1 minute window
+
+  constructor(private config: RateLimitConfig) {}
+
+  /**
+   * Check if operation is allowed under rate limit
+   */
+  checkLimit(operation: keyof RateLimitConfig): boolean {
+    const limit = this.config[operation];
+    const now = Date.now();
+    const state = this.windows.get(operation);
+
+    if (!state || now - state.windowStart >= this.windowMs) {
+      // New window
+      this.windows.set(operation, {
+        operation,
+        count: 1,
+        windowStart: now,
+        blocked: false,
+      });
+      return true;
+    }
+
+    if (state.count >= limit) {
+      state.blocked = true;
+      state.nextAllowedAt = state.windowStart + this.windowMs;
+      return false;
+    }
+
+    state.count++;
+    return true;
+  }
+
+  /**
+   * Get current state for an operation
+   */
+  getState(operation: string): RateLimitState | undefined {
+    return this.windows.get(operation);
+  }
+
+  /**
+   * Reset rate limit for an operation
+   */
+  reset(operation?: string): void {
+    if (operation) {
+      this.windows.delete(operation);
+    } else {
+      this.windows.clear();
+    }
+  }
+
+  /**
+   * Get remaining quota for an operation
+   */
+  getRemaining(operation: keyof RateLimitConfig): number {
+    const limit = this.config[operation];
+    const state = this.windows.get(operation);
+    if (!state) return limit;
+    return Math.max(0, limit - state.count);
+  }
+}
+
+// ============================================================================
+// Metrics Collector Class
+// ============================================================================
+
+class MetricsCollector {
+  private metrics: BridgeMetrics;
+  private readonly maxHistogramSize = 1000;
+
+  constructor() {
+    this.metrics = this.createEmptyMetrics();
+  }
+
+  private createEmptyMetrics(): BridgeMetrics {
+    return {
+      teamsCreated: 0,
+      teammatesSpawned: 0,
+      messagesSent: 0,
+      broadcastsSent: 0,
+      plansSubmitted: 0,
+      plansApproved: 0,
+      plansRejected: 0,
+      swarmsLaunched: 0,
+      delegationsGranted: 0,
+      errorsCount: 0,
+      activeTeams: 0,
+      activeTeammates: 0,
+      pendingPlans: 0,
+      mailboxSize: 0,
+      spawnLatency: [],
+      messageLatency: [],
+      planApprovalLatency: [],
+      rateLimitHits: 0,
+      rateLimitBlocks: 0,
+      healthChecksPassed: 0,
+      healthChecksFailed: 0,
+      startedAt: new Date(),
+      lastActivityAt: new Date(),
+    };
+  }
+
+  increment(metric: keyof BridgeMetrics, amount = 1): void {
+    const value = this.metrics[metric];
+    if (typeof value === 'number') {
+      (this.metrics[metric] as number) += amount;
+    }
+    this.metrics.lastActivityAt = new Date();
+  }
+
+  decrement(metric: keyof BridgeMetrics, amount = 1): void {
+    const value = this.metrics[metric];
+    if (typeof value === 'number') {
+      (this.metrics[metric] as number) = Math.max(0, (value as number) - amount);
+    }
+  }
+
+  set(metric: keyof BridgeMetrics, value: number): void {
+    if (typeof this.metrics[metric] === 'number') {
+      (this.metrics[metric] as number) = value;
+    }
+  }
+
+  recordLatency(metric: 'spawnLatency' | 'messageLatency' | 'planApprovalLatency', ms: number): void {
+    const arr = this.metrics[metric];
+    if (arr.length >= this.maxHistogramSize) {
+      arr.shift(); // Remove oldest
+    }
+    arr.push(ms);
+  }
+
+  getSnapshot(): MetricSnapshot {
+    const elapsed = (Date.now() - this.metrics.startedAt.getTime()) / 1000;
+    return {
+      timestamp: new Date(),
+      metrics: { ...this.metrics },
+      rates: {
+        messagesPerSecond: elapsed > 0 ? this.metrics.messagesSent / elapsed : 0,
+        spawnsPerMinute: elapsed > 0 ? (this.metrics.teammatesSpawned / elapsed) * 60 : 0,
+        errorRate: this.metrics.messagesSent > 0
+          ? this.metrics.errorsCount / this.metrics.messagesSent
+          : 0,
+      },
+    };
+  }
+
+  getPercentile(metric: 'spawnLatency' | 'messageLatency' | 'planApprovalLatency', percentile: number): number {
+    const arr = [...this.metrics[metric]].sort((a, b) => a - b);
+    if (arr.length === 0) return 0;
+    const index = Math.ceil((percentile / 100) * arr.length) - 1;
+    return arr[Math.max(0, index)];
+  }
+
+  reset(): void {
+    this.metrics = this.createEmptyMetrics();
+  }
+}
+
+// ============================================================================
+// Health Checker Class
+// ============================================================================
+
+class HealthChecker {
+  private checks: Map<string, TeammateHealthCheck> = new Map();
+  private intervals: Map<string, NodeJS.Timeout> = new Map();
+
+  constructor(
+    private config: HealthCheckConfig,
+    private onStatusChange?: (check: TeammateHealthCheck) => void
+  ) {}
+
+  /**
+   * Start health checks for a teammate
+   */
+  startChecking(teammateId: string, teamName: string, checkFn: () => Promise<boolean>): void {
+    if (!this.config.enabled) return;
+
+    const check: TeammateHealthCheck = {
+      teammateId,
+      teamName,
+      status: 'unknown',
+      lastCheck: new Date(),
+      lastHealthy: null,
+      consecutiveFailures: 0,
+      consecutiveSuccesses: 0,
+      latencyMs: null,
+    };
+    this.checks.set(teammateId, check);
+
+    const interval = setInterval(async () => {
+      await this.performCheck(teammateId, checkFn);
+    }, this.config.intervalMs);
+
+    this.intervals.set(teammateId, interval);
+
+    // Perform initial check
+    this.performCheck(teammateId, checkFn);
+  }
+
+  /**
+   * Stop health checks for a teammate
+   */
+  stopChecking(teammateId: string): void {
+    const interval = this.intervals.get(teammateId);
+    if (interval) {
+      clearInterval(interval);
+      this.intervals.delete(teammateId);
+    }
+    this.checks.delete(teammateId);
+  }
+
+  /**
+   * Perform a single health check
+   */
+  private async performCheck(teammateId: string, checkFn: () => Promise<boolean>): Promise<void> {
+    const check = this.checks.get(teammateId);
+    if (!check) return;
+
+    const startTime = Date.now();
+    const previousStatus = check.status;
+
+    try {
+      const timeoutPromise = new Promise<boolean>((_, reject) => {
+        setTimeout(() => reject(new Error('Health check timeout')), this.config.timeoutMs);
+      });
+
+      const healthy = await Promise.race([checkFn(), timeoutPromise]);
+      const latency = Date.now() - startTime;
+
+      check.lastCheck = new Date();
+      check.latencyMs = latency;
+
+      if (healthy) {
+        check.consecutiveSuccesses++;
+        check.consecutiveFailures = 0;
+        check.lastHealthy = new Date();
+        check.error = undefined;
+
+        if (check.consecutiveSuccesses >= this.config.healthyThreshold) {
+          check.status = 'healthy';
+        } else if (check.status === 'unhealthy') {
+          check.status = 'degraded';
+        }
+      } else {
+        throw new Error('Health check returned false');
+      }
+    } catch (error) {
+      check.lastCheck = new Date();
+      check.consecutiveFailures++;
+      check.consecutiveSuccesses = 0;
+      check.error = error instanceof Error ? error.message : String(error);
+
+      if (check.consecutiveFailures >= this.config.unhealthyThreshold) {
+        check.status = 'unhealthy';
+      } else {
+        check.status = 'degraded';
+      }
+    }
+
+    if (check.status !== previousStatus && this.onStatusChange) {
+      this.onStatusChange(check);
+    }
+  }
+
+  /**
+   * Get health check for a teammate
+   */
+  getCheck(teammateId: string): TeammateHealthCheck | undefined {
+    return this.checks.get(teammateId);
+  }
+
+  /**
+   * Get team health report
+   */
+  getTeamReport(teamName: string): TeamHealthReport {
+    const teammates = Array.from(this.checks.values())
+      .filter(c => c.teamName === teamName);
+
+    const healthyCount = teammates.filter(t => t.status === 'healthy').length;
+    const degradedCount = teammates.filter(t => t.status === 'degraded').length;
+    const unhealthyCount = teammates.filter(t => t.status === 'unhealthy').length;
+
+    let overallStatus: HealthStatus = 'healthy';
+    if (unhealthyCount > 0) {
+      overallStatus = unhealthyCount > teammates.length / 2 ? 'unhealthy' : 'degraded';
+    } else if (degradedCount > 0) {
+      overallStatus = 'degraded';
+    }
+
+    return {
+      teamName,
+      overallStatus,
+      healthyCount,
+      degradedCount,
+      unhealthyCount,
+      teammates,
+      checkedAt: new Date(),
+    };
+  }
+
+  /**
+   * Stop all health checks
+   */
+  stopAll(): void {
+    for (const interval of this.intervals.values()) {
+      clearInterval(interval);
+    }
+    this.intervals.clear();
+    this.checks.clear();
+  }
+}
+
+// ============================================================================
+// Retry Helper
+// ============================================================================
+
+async function withRetry<T>(
+  fn: () => Promise<T>,
+  config: RetryConfig,
+  isRetryable?: (error: Error) => boolean
+): Promise<T> {
+  let lastError: Error | null = null;
+  let delay = config.initialDelayMs;
+
+  for (let attempt = 1; attempt <= config.maxRetries + 1; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error));
+
+      // Check if error is retryable
+      if (isRetryable && !isRetryable(lastError)) {
+        throw lastError;
+      }
+
+      // Check if we've exhausted retries
+      if (attempt > config.maxRetries) {
+        throw lastError;
+      }
+
+      // Wait before retrying
+      await new Promise(resolve => setTimeout(resolve, delay));
+
+      // Exponential backoff
+      delay = Math.min(delay * config.backoffMultiplier, config.maxDelayMs);
+    }
+  }
+
+  throw lastError;
+}
+
+// ============================================================================
+// Circuit Breaker
+// ============================================================================
+
+class CircuitBreaker {
+  private state: CircuitBreakerState;
+
+  constructor(private config: CircuitBreakerConfig) {
+    this.state = {
+      state: 'closed',
+      failures: 0,
+      successes: 0,
+      lastFailure: null,
+      lastSuccess: null,
+      openedAt: null,
+      nextAttemptAt: null,
+    };
+  }
+
+  async execute<T>(fn: () => Promise<T>): Promise<T> {
+    if (!this.config.enabled) {
+      return fn();
+    }
+
+    if (this.state.state === 'open') {
+      if (this.state.nextAttemptAt && Date.now() >= this.state.nextAttemptAt.getTime()) {
+        this.state.state = 'half-open';
+      } else {
+        throw new TeammateError(
+          'Circuit breaker is open',
+          TeammateErrorCode.BACKEND_UNAVAILABLE
+        );
+      }
+    }
+
+    try {
+      const result = await Promise.race([
+        fn(),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error('Circuit breaker timeout')), this.config.timeoutMs)
+        ),
+      ]);
+
+      this.recordSuccess();
+      return result;
+    } catch (error) {
+      this.recordFailure();
+      throw error;
+    }
+  }
+
+  private recordSuccess(): void {
+    this.state.failures = 0;
+    this.state.successes++;
+    this.state.lastSuccess = new Date();
+
+    if (this.state.state === 'half-open' && this.state.successes >= this.config.successThreshold) {
+      this.state.state = 'closed';
+      this.state.openedAt = null;
+      this.state.nextAttemptAt = null;
+    }
+  }
+
+  private recordFailure(): void {
+    this.state.failures++;
+    this.state.successes = 0;
+    this.state.lastFailure = new Date();
+
+    if (this.state.failures >= this.config.failureThreshold) {
+      this.state.state = 'open';
+      this.state.openedAt = new Date();
+      this.state.nextAttemptAt = new Date(Date.now() + this.config.resetTimeMs);
+    }
+  }
+
+  getState(): CircuitBreakerState {
+    return { ...this.state };
+  }
+
+  reset(): void {
+    this.state = {
+      state: 'closed',
+      failures: 0,
+      successes: 0,
+      lastFailure: null,
+      lastSuccess: null,
+      openedAt: null,
+      nextAttemptAt: null,
+    };
   }
 }
 
@@ -234,6 +709,16 @@ export class TeammateBridge extends EventEmitter {
   private teamConfigCache: Map<string, { config: TeamConfig; timestamp: number }> = new Map();
   private readonly cacheMaxAgeMs = 30000; // 30 seconds
 
+  // Rate limiting, metrics, health, circuit breaker
+  private rateLimiter: RateLimiter;
+  private metrics: MetricsCollector;
+  private healthChecker: HealthChecker;
+  private circuitBreaker: CircuitBreaker;
+
+  // Message TTL cleanup
+  private messageTTLTimer: NodeJS.Timeout | null = null;
+  private readonly messageTTLCheckIntervalMs = 60000; // 1 minute
+
   private readonly config: PluginConfig;
   private readonly teamsDir: string;
 
@@ -241,6 +726,35 @@ export class TeammateBridge extends EventEmitter {
     super();
     this.config = { ...DEFAULT_PLUGIN_CONFIG, ...config };
     this.teamsDir = path.join(os.homedir(), '.claude', 'teams');
+
+    // Initialize rate limiter
+    this.rateLimiter = new RateLimiter(DEFAULT_RATE_LIMIT_CONFIG);
+
+    // Initialize metrics collector
+    this.metrics = new MetricsCollector();
+
+    // Initialize health checker with status change callback
+    this.healthChecker = new HealthChecker(
+      DEFAULT_HEALTH_CHECK_CONFIG,
+      (check) => this.onHealthStatusChange(check)
+    );
+
+    // Initialize circuit breaker
+    this.circuitBreaker = new CircuitBreaker(DEFAULT_CIRCUIT_BREAKER_CONFIG);
+  }
+
+  /**
+   * Handle health status changes
+   */
+  private onHealthStatusChange(check: TeammateHealthCheck): void {
+    this.emit('health:changed', check);
+
+    if (check.status === 'unhealthy') {
+      this.metrics.increment('healthChecksFailed');
+      this.emit('health:unhealthy', check);
+    } else if (check.status === 'healthy') {
+      this.metrics.increment('healthChecksPassed');
+    }
   }
 
   // ==========================================================================
@@ -319,6 +833,96 @@ export class TeammateBridge extends EventEmitter {
    */
   isAvailable(): boolean {
     return this.teammateToolAvailable;
+  }
+
+  // ==========================================================================
+  // Metrics & Observability
+  // ==========================================================================
+
+  /**
+   * Get current metrics snapshot
+   */
+  getMetrics(): MetricSnapshot {
+    return this.metrics.getSnapshot();
+  }
+
+  /**
+   * Get latency percentile for an operation
+   */
+  getLatencyPercentile(
+    operation: 'spawnLatency' | 'messageLatency' | 'planApprovalLatency',
+    percentile: number
+  ): number {
+    return this.metrics.getPercentile(operation, percentile);
+  }
+
+  /**
+   * Reset metrics
+   */
+  resetMetrics(): void {
+    this.metrics.reset();
+  }
+
+  // ==========================================================================
+  // Health Checks
+  // ==========================================================================
+
+  /**
+   * Get health check for a specific teammate
+   */
+  getTeammateHealth(teammateId: string): TeammateHealthCheck | undefined {
+    return this.healthChecker.getCheck(teammateId);
+  }
+
+  /**
+   * Get health report for a team
+   */
+  getTeamHealth(teamName: string): TeamHealthReport {
+    return this.healthChecker.getTeamReport(teamName);
+  }
+
+  // ==========================================================================
+  // Rate Limiting
+  // ==========================================================================
+
+  /**
+   * Get remaining rate limit quota for an operation
+   */
+  getRateLimitRemaining(operation: keyof RateLimitConfig): number {
+    return this.rateLimiter.getRemaining(operation);
+  }
+
+  /**
+   * Check if an operation is rate limited
+   */
+  isRateLimited(operation: keyof RateLimitConfig): boolean {
+    const state = this.rateLimiter.getState(operation);
+    return state?.blocked ?? false;
+  }
+
+  /**
+   * Reset rate limits
+   */
+  resetRateLimits(operation?: string): void {
+    this.rateLimiter.reset(operation);
+  }
+
+  // ==========================================================================
+  // Circuit Breaker
+  // ==========================================================================
+
+  /**
+   * Get circuit breaker state
+   */
+  getCircuitBreakerState(): CircuitBreakerState {
+    return this.circuitBreaker.getState();
+  }
+
+  /**
+   * Reset circuit breaker
+   */
+  resetCircuitBreaker(): void {
+    this.circuitBreaker.reset();
   }
 
   /**
@@ -602,6 +1206,18 @@ export class TeammateBridge extends EventEmitter {
   async spawnTeammate(config: TeammateSpawnConfig): Promise<TeammateInfo> {
     this.ensureAvailable();
 
+    // Rate limiting check
+    if (!this.rateLimiter.checkLimit('spawnPerMinute')) {
+      this.metrics.increment('rateLimitBlocks');
+      throw new TeammateError(
+        'Spawn rate limit exceeded. Please wait before spawning more teammates.',
+        TeammateErrorCode.PERMISSION_DENIED
+      );
+    }
+    this.metrics.increment('rateLimitHits');
+
+    const startTime = Date.now();
+
     // Security: Validate teammate name
     const validatedName = validateName(config.name, 'teammate');
 
@@ -658,6 +1274,22 @@ export class TeammateBridge extends EventEmitter {
       }
     }
 
+    // Record metrics
+    const spawnLatency = Date.now() - startTime;
+    this.metrics.recordLatency('spawnLatency', spawnLatency);
+    this.metrics.increment('teammatesSpawned');
+    this.metrics.increment('activeTeammates');
+
+    // Start health checking for this teammate
+    if (teamName) {
+      this.healthChecker.startChecking(teammateId, teamName, async () => {
+        // Health check: verify teammate exists in team state
+        const team = this.activeTeams.get(teamName);
+        const teammate = team?.teammates.find(t => t.id === teammateId);
+        return teammate?.status === 'active';
+      });
+    }
+
     this.emit('teammate:spawned', { teammate: teammateInfo, agentInput });
 
     return teammateInfo;
@@ -696,6 +1328,17 @@ export class TeammateBridge extends EventEmitter {
   ): Promise<MailboxMessage> {
     this.ensureAvailable();
 
+    // Rate limiting check
+    if (!this.rateLimiter.checkLimit('messagesPerMinute')) {
+      this.metrics.increment('rateLimitBlocks');
+      throw new TeammateError(
+        'Message rate limit exceeded',
+        TeammateErrorCode.PERMISSION_DENIED,
+        teamName
+      );
+    }
+
+    const startTime = Date.now();
     const team = this.getTeamOrThrow(teamName);
 
     const fullMessage: MailboxMessage = {
@@ -716,6 +1359,10 @@ export class TeammateBridge extends EventEmitter {
     const sender = team.teammates.find(t => t.id === fromId);
     if (sender) sender.messagesSent++;
 
+    // Record metrics
+    this.metrics.recordLatency('messageLatency', Date.now() - startTime);
+    this.metrics.increment('messagesSent');
+
     this.emit('message:sent', { team: teamName, message: fullMessage });
 
     return fullMessage;
@@ -730,6 +1377,16 @@ export class TeammateBridge extends EventEmitter {
     message: { type: MessageType; payload: unknown; priority?: MailboxMessage['priority'] }
   ): Promise<MailboxMessage> {
     this.ensureAvailable();
+
+    // Rate limiting check
+    if (!this.rateLimiter.checkLimit('broadcastsPerMinute')) {
+      this.metrics.increment('rateLimitBlocks');
+      throw new TeammateError(
+        'Broadcast rate limit exceeded',
+        TeammateErrorCode.PERMISSION_DENIED,
+        teamName
+      );
+    }
 
     const team = this.getTeamOrThrow(teamName);
 
@@ -751,6 +1408,9 @@ export class TeammateBridge extends EventEmitter {
     }
 
     team.messageCount += team.teammates.length - 1;
+
+    // Record metrics
+    this.metrics.increment('broadcastsSent');
 
     this.emit('message:broadcast', { team: teamName, message: fullMessage });
 

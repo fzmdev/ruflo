@@ -24,6 +24,31 @@ export const SECURITY_LIMITS = {
   MAX_DELEGATION_DEPTH: 5,
 } as const;
 
+// Rate limiting defaults
+export const RATE_LIMIT_DEFAULTS = {
+  SPAWN_PER_MINUTE: 10,
+  MESSAGES_PER_MINUTE: 100,
+  BROADCASTS_PER_MINUTE: 20,
+  PLANS_PER_MINUTE: 5,
+  API_CALLS_PER_MINUTE: 200,
+} as const;
+
+// Retry configuration
+export const RETRY_DEFAULTS = {
+  MAX_RETRIES: 3,
+  INITIAL_DELAY_MS: 100,
+  MAX_DELAY_MS: 5000,
+  BACKOFF_MULTIPLIER: 2,
+} as const;
+
+// Health check configuration
+export const HEALTH_CHECK_DEFAULTS = {
+  INTERVAL_MS: 30000, // 30 seconds
+  TIMEOUT_MS: 5000,   // 5 seconds
+  UNHEALTHY_THRESHOLD: 3,
+  HEALTHY_THRESHOLD: 2,
+} as const;
+
 export interface VersionInfo {
   claudeCode: string | null;
   plugin: string;
@@ -539,4 +564,193 @@ export const DEFAULT_PLUGIN_CONFIG: PluginConfig = {
     maxMessages: 1000,
     retentionMs: 3600000, // 1 hour
   },
+};
+
+// ============================================================================
+// Rate Limiting
+// ============================================================================
+
+export interface RateLimitConfig {
+  spawnPerMinute: number;
+  messagesPerMinute: number;
+  broadcastsPerMinute: number;
+  plansPerMinute: number;
+  apiCallsPerMinute: number;
+}
+
+export interface RateLimitState {
+  operation: string;
+  count: number;
+  windowStart: number;
+  blocked: boolean;
+  nextAllowedAt?: number;
+}
+
+export const DEFAULT_RATE_LIMIT_CONFIG: RateLimitConfig = {
+  spawnPerMinute: RATE_LIMIT_DEFAULTS.SPAWN_PER_MINUTE,
+  messagesPerMinute: RATE_LIMIT_DEFAULTS.MESSAGES_PER_MINUTE,
+  broadcastsPerMinute: RATE_LIMIT_DEFAULTS.BROADCASTS_PER_MINUTE,
+  plansPerMinute: RATE_LIMIT_DEFAULTS.PLANS_PER_MINUTE,
+  apiCallsPerMinute: RATE_LIMIT_DEFAULTS.API_CALLS_PER_MINUTE,
+};
+
+// ============================================================================
+// Metrics & Telemetry
+// ============================================================================
+
+export interface BridgeMetrics {
+  // Counters
+  teamsCreated: number;
+  teammatesSpawned: number;
+  messagesSent: number;
+  broadcastsSent: number;
+  plansSubmitted: number;
+  plansApproved: number;
+  plansRejected: number;
+  swarmsLaunched: number;
+  delegationsGranted: number;
+  errorsCount: number;
+
+  // Gauges
+  activeTeams: number;
+  activeTeammates: number;
+  pendingPlans: number;
+  mailboxSize: number;
+
+  // Histograms (timing in ms)
+  spawnLatency: number[];
+  messageLatency: number[];
+  planApprovalLatency: number[];
+
+  // Rate limiting
+  rateLimitHits: number;
+  rateLimitBlocks: number;
+
+  // Health
+  healthChecksPassed: number;
+  healthChecksFailed: number;
+
+  // Timestamps
+  startedAt: Date;
+  lastActivityAt: Date;
+}
+
+export interface MetricSnapshot {
+  timestamp: Date;
+  metrics: BridgeMetrics;
+  rates: {
+    messagesPerSecond: number;
+    spawnsPerMinute: number;
+    errorRate: number;
+  };
+}
+
+// ============================================================================
+// Health Checks
+// ============================================================================
+
+export type HealthStatus = 'healthy' | 'degraded' | 'unhealthy' | 'unknown';
+
+export interface TeammateHealthCheck {
+  teammateId: string;
+  teamName: string;
+  status: HealthStatus;
+  lastCheck: Date;
+  lastHealthy: Date | null;
+  consecutiveFailures: number;
+  consecutiveSuccesses: number;
+  latencyMs: number | null;
+  error?: string;
+}
+
+export interface TeamHealthReport {
+  teamName: string;
+  overallStatus: HealthStatus;
+  healthyCount: number;
+  degradedCount: number;
+  unhealthyCount: number;
+  teammates: TeammateHealthCheck[];
+  checkedAt: Date;
+}
+
+export interface HealthCheckConfig {
+  enabled: boolean;
+  intervalMs: number;
+  timeoutMs: number;
+  unhealthyThreshold: number;
+  healthyThreshold: number;
+  autoRemoveUnhealthy: boolean;
+}
+
+export const DEFAULT_HEALTH_CHECK_CONFIG: HealthCheckConfig = {
+  enabled: true,
+  intervalMs: HEALTH_CHECK_DEFAULTS.INTERVAL_MS,
+  timeoutMs: HEALTH_CHECK_DEFAULTS.TIMEOUT_MS,
+  unhealthyThreshold: HEALTH_CHECK_DEFAULTS.UNHEALTHY_THRESHOLD,
+  healthyThreshold: HEALTH_CHECK_DEFAULTS.HEALTHY_THRESHOLD,
+  autoRemoveUnhealthy: false,
+};
+
+// ============================================================================
+// Retry Logic
+// ============================================================================
+
+export interface RetryConfig {
+  maxRetries: number;
+  initialDelayMs: number;
+  maxDelayMs: number;
+  backoffMultiplier: number;
+  retryableErrors: TeammateErrorCode[];
+}
+
+export interface RetryState {
+  attempt: number;
+  lastError: Error | null;
+  nextRetryAt: Date | null;
+  totalDelayMs: number;
+}
+
+export const DEFAULT_RETRY_CONFIG: RetryConfig = {
+  maxRetries: RETRY_DEFAULTS.MAX_RETRIES,
+  initialDelayMs: RETRY_DEFAULTS.INITIAL_DELAY_MS,
+  maxDelayMs: RETRY_DEFAULTS.MAX_DELAY_MS,
+  backoffMultiplier: RETRY_DEFAULTS.BACKOFF_MULTIPLIER,
+  retryableErrors: [
+    TeammateErrorCode.TIMEOUT,
+    TeammateErrorCode.BACKEND_UNAVAILABLE,
+    TeammateErrorCode.REMOTE_SYNC_FAILED,
+    TeammateErrorCode.MEMORY_SAVE_FAILED,
+  ],
+};
+
+// ============================================================================
+// Circuit Breaker
+// ============================================================================
+
+export type CircuitState = 'closed' | 'open' | 'half-open';
+
+export interface CircuitBreakerConfig {
+  enabled: boolean;
+  failureThreshold: number;
+  successThreshold: number;
+  timeoutMs: number;
+  resetTimeMs: number;
+}
+
+export interface CircuitBreakerState {
+  state: CircuitState;
+  failures: number;
+  successes: number;
+  lastFailure: Date | null;
+  lastSuccess: Date | null;
+  openedAt: Date | null;
+  nextAttemptAt: Date | null;
+}
+
+export const DEFAULT_CIRCUIT_BREAKER_CONFIG: CircuitBreakerConfig = {
+  enabled: true,
+  failureThreshold: 5,
+  successThreshold: 2,
+  timeoutMs: 10000,
+  resetTimeMs: 30000,
 };

@@ -61,6 +61,21 @@ export {
   SECURITY_LIMITS,
   DEFAULT_PLUGIN_CONFIG,
 
+  // Rate limiting
+  RATE_LIMIT_DEFAULTS,
+  DEFAULT_RATE_LIMIT_CONFIG,
+
+  // Health checks
+  HEALTH_CHECK_DEFAULTS,
+  DEFAULT_HEALTH_CHECK_CONFIG,
+
+  // Retry configuration
+  RETRY_DEFAULTS,
+  DEFAULT_RETRY_CONFIG,
+
+  // Circuit breaker
+  DEFAULT_CIRCUIT_BREAKER_CONFIG,
+
   // Enums
   TeammateErrorCode,
 
@@ -103,6 +118,29 @@ export {
   type ExitPlanModeInput,
   type TeammateBridgeEvents,
   type PluginConfig,
+
+  // Rate limiting types
+  type RateLimitConfig,
+  type RateLimitState,
+
+  // Metrics types
+  type BridgeMetrics,
+  type MetricSnapshot,
+
+  // Health check types
+  type HealthStatus,
+  type TeammateHealthCheck,
+  type TeamHealthReport,
+  type HealthCheckConfig,
+
+  // Retry types
+  type RetryConfig,
+  type RetryState,
+
+  // Circuit breaker types
+  type CircuitState,
+  type CircuitBreakerConfig,
+  type CircuitBreakerState,
 } from './types.js';
 
 // Default export
