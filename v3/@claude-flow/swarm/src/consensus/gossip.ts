@@ -26,9 +26,9 @@ export interface GossipMessage {
 
 /**
  * Bounded set that evicts oldest entries when capacity is reached.
- * Uses Map insertion-order for O(1) operations. (PERF-01)
+ * Uses Map insertion-order for O(1) FIFO eviction. (PERF-01)
  */
-class BoundedSet<T> {
+export class BoundedSet<T> {
   private map = new Map<T, true>();
   private readonly maxSize: number;
 
@@ -105,7 +105,7 @@ export class GossipConsensus extends EventEmitter {
       state: new Map(),
       version: 0,
       neighbors: new Set(),
-      seenMessages: new BoundedSet(100_000), // PERF-01: ~4MB cap, covers ~16min at max throughput
+      seenMessages: new BoundedSet(100_000), // PERF-01: ~4MB cap (100K × ~40B IDs)
       lastSync: new Date(),
     };
   }
@@ -128,7 +128,7 @@ export class GossipConsensus extends EventEmitter {
       state: new Map(),
       version: 0,
       neighbors: new Set(),
-      seenMessages: new BoundedSet(100_000), // PERF-01: bounded to prevent memory leak
+      seenMessages: new BoundedSet(100_000), // PERF-01: bounded to prevent memory leak (~4MB cap)
       lastSync: new Date(),
     });
 

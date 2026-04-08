@@ -43,8 +43,16 @@ interface ImportStats {
 
 /**
  * Format a ruvector embedding array for PostgreSQL
+ * Validates each element is a finite number to prevent SQL injection via crafted arrays.
  */
 function formatEmbedding(embedding: number[], dimensions: number = 384): string {
+  // Validate every element is a finite number (prevents SQL injection via crafted JSON)
+  for (let i = 0; i < embedding.length; i++) {
+    if (typeof embedding[i] !== 'number' || !Number.isFinite(embedding[i])) {
+      throw new Error(`Invalid embedding value at index ${i}: expected finite number, got ${typeof embedding[i]}`);
+    }
+  }
+
   // Ensure correct dimensions by padding or truncating
   const padded = [...embedding];
   while (padded.length < dimensions) {

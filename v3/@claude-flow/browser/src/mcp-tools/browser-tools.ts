@@ -621,7 +621,10 @@ const waitTools: MCPTool[] = [
 // JavaScript Execution
 // ============================================================================
 
-// Dangerous patterns that should never appear in eval scripts (CRIT-03)
+// Defense-in-depth: pattern blocklist for eval scripts (CRIT-03)
+// NOTE: This is a best-effort defense layer, not a sandbox. Determined attackers can bypass
+// pattern matching via encoding/obfuscation. The primary defense is the browser sandbox itself.
+// This blocklist catches accidental misuse and unsophisticated injection attempts.
 const DANGEROUS_EVAL_PATTERNS = [
   /\bprocess\b/,           // Node.js process access
   /\brequire\b/,           // CommonJS require
